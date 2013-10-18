@@ -85,7 +85,7 @@ import java.util.Locale;
      *   400-499 Honeycomb
      * </pre>
      */
-    static final int DATABASE_VERSION = 353;
+    static final int DATABASE_VERSION = 354;
 
     private static final String DATABASE_NAME = "contacts2.db";
     private static final String DATABASE_PRESENCE = "presence_db";
@@ -1255,7 +1255,8 @@ import java.util.Locale;
                         + " AS " + Contacts.STARRED + ", "
                 + ContactsColumns.CONCRETE_TIMES_CONTACTED
                         + " AS " + Contacts.TIMES_CONTACTED + ", "
-                + ContactsColumns.LAST_STATUS_UPDATE_ID;
+                + ContactsColumns.LAST_STATUS_UPDATE_ID + ", "
+                + Contacts.NAME_RAW_CONTACT_ID;
 
         String contactsSelect = "SELECT "
                 + ContactsColumns.CONCRETE_ID + " AS " + Contacts._ID + ","
@@ -1524,6 +1525,12 @@ import java.util.Locale;
         if (oldVersion == 352) {
             upgradeToVersion353(db);
             oldVersion = 353;
+        }
+
+        if (oldVersion == 353) {
+            // Add column NAME_RAW_CONTACT_ID
+            upgradeViewsAndTriggers = true;
+            oldVersion = 354;
         }
 
         if (upgradeViewsAndTriggers) {
