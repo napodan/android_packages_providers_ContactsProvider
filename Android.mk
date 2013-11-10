@@ -10,7 +10,7 @@ LOCAL_SRC_FILES += \
 
 LOCAL_JAVA_LIBRARIES := ext
 
-LOCAL_STATIC_JAVA_LIBRARIES += android-common
+LOCAL_STATIC_JAVA_LIBRARIES += android-common com.android.vcard
 
 # The Emma tool analyzes code coverage when running unit tests on the
 # application. This configuration line selects which packages will be analyzed,
