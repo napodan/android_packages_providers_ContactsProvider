@@ -85,7 +85,7 @@ import java.util.Locale;
      *   400-499 Honeycomb
      * </pre>
      */
-    static final int DATABASE_VERSION = 353;
+    static final int DATABASE_VERSION = 355;
 
     private static final String DATABASE_NAME = "contacts2.db";
     private static final String DATABASE_PRESENCE = "presence_db";
@@ -878,6 +878,8 @@ import java.util.Locale;
                 Groups.DELETED + " INTEGER NOT NULL DEFAULT 0," +
                 Groups.GROUP_VISIBLE + " INTEGER NOT NULL DEFAULT 0," +
                 Groups.SHOULD_SYNC + " INTEGER NOT NULL DEFAULT 1," +
+                Groups.AUTO_ADD + " INTEGER NOT NULL DEFAULT 0," +
+                Groups.FAVORITES + " INTEGER NOT NULL DEFAULT 0," +
                 Groups.SYNC1 + " TEXT, " +
                 Groups.SYNC2 + " TEXT, " +
                 Groups.SYNC3 + " TEXT, " +
@@ -1255,7 +1257,8 @@ import java.util.Locale;
                         + " AS " + Contacts.STARRED + ", "
                 + ContactsColumns.CONCRETE_TIMES_CONTACTED
                         + " AS " + Contacts.TIMES_CONTACTED + ", "
-                + ContactsColumns.LAST_STATUS_UPDATE_ID;
+                + ContactsColumns.LAST_STATUS_UPDATE_ID + ", "
+                + Contacts.NAME_RAW_CONTACT_ID;
 
         String contactsSelect = "SELECT "
                 + ContactsColumns.CONCRETE_ID + " AS " + Contacts._ID + ","
@@ -1284,6 +1287,8 @@ import java.util.Locale;
                 + Groups.DELETED + ","
                 + Groups.GROUP_VISIBLE + ","
                 + Groups.SHOULD_SYNC + ","
+                + Groups.AUTO_ADD + ","
+                + Groups.FAVORITES + ","
                 + Groups.SYNC1 + ","
                 + Groups.SYNC2 + ","
                 + Groups.SYNC3 + ","
@@ -1524,6 +1529,18 @@ import java.util.Locale;
         if (oldVersion == 352) {
             upgradeToVersion353(db);
             oldVersion = 353;
+        }
+
+        if (oldVersion == 353) {
+            // Add column NAME_RAW_CONTACT_ID
+            upgradeViewsAndTriggers = true;
+            oldVersion = 354;
+        }
+
+        if (oldVersion == 354) {
+            upgradeViewsAndTriggers = true;
+            upgradeToVersion355(db);
+            oldVersion = 355;
         }
 
         if (upgradeViewsAndTriggers) {
@@ -2153,6 +2170,13 @@ import java.util.Locale;
     private void upgradeToVersion353(SQLiteDatabase db) {
         db.execSQL("DELETE FROM contacts " +
                 "WHERE NOT EXISTS (SELECT 1 FROM raw_contacts WHERE contact_id=contacts._id)");
+    }
+
+    private void upgradeToVersion355(SQLiteDatabase db) {
+        db.execSQL("ALTER TABLE " + Tables.GROUPS
+                + " ADD " + Groups.FAVORITES + " INTEGER NOT NULL DEFAULT 0;");
+        db.execSQL("ALTER TABLE " + Tables.GROUPS
+                + " ADD " + Groups.AUTO_ADD + " INTEGER NOT NULL DEFAULT 0;");
     }
 
     private void rebuildNameLookup(SQLiteDatabase db) {

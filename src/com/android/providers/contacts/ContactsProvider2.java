@@ -147,7 +147,6 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
     /** Default for the maximum number of returned aggregation suggestions. */
     private static final int DEFAULT_MAX_SUGGESTIONS = 5;
 
-    private static final String GOOGLE_MY_CONTACTS_GROUP_TITLE = "System Group: My Contacts";
     /**
      * Property key for the legacy contact import version. The need for a version
      * as opposed to a boolean flag is that if we discover bugs in the contact import process,
@@ -197,6 +196,8 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
     private static final int CONTACTS_PHOTO = 1009;
     private static final int CONTACTS_AS_VCARD = 1010;
     private static final int CONTACTS_AS_MULTI_VCARD = 1011;
+    private static final int CONTACTS_LOOKUP_DATA = 1012;
+    private static final int CONTACTS_LOOKUP_ID_DATA = 1013;
 
     private static final int RAW_CONTACTS = 2002;
     private static final int RAW_CONTACTS_ID = 2003;
@@ -245,6 +246,33 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
     private static final int RAW_CONTACT_ENTITIES = 15001;
 
     private static final int PROVIDER_STATUS = 16001;
+
+    private static final String SELECTION_FAVORITES_GROUPS_BY_RAW_CONTACT_ID =
+            RawContactsColumns.CONCRETE_ID + "=? AND "
+                    + GroupsColumns.CONCRETE_ACCOUNT_NAME
+                    + "=" + RawContactsColumns.CONCRETE_ACCOUNT_NAME + " AND "
+                    + GroupsColumns.CONCRETE_ACCOUNT_TYPE
+                    + "=" + RawContactsColumns.CONCRETE_ACCOUNT_TYPE
+                    + " AND " + Groups.FAVORITES + " != 0";
+
+    private static final String SELECTION_AUTO_ADD_GROUPS_BY_RAW_CONTACT_ID =
+            RawContactsColumns.CONCRETE_ID + "=? AND "
+                    + GroupsColumns.CONCRETE_ACCOUNT_NAME + "="
+                    + RawContactsColumns.CONCRETE_ACCOUNT_NAME + " AND "
+                    + GroupsColumns.CONCRETE_ACCOUNT_TYPE + "="
+                    + RawContactsColumns.CONCRETE_ACCOUNT_TYPE + " AND "
+                    + Groups.AUTO_ADD + " != 0";
+
+    private static final String[] PROJECTION_GROUP_ID
+            = new String[]{Tables.GROUPS + "." + Groups._ID};
+
+    private static final String SELECTION_GROUPMEMBERSHIP_DATA = DataColumns.MIMETYPE_ID + "=? "
+            + "AND " + GroupMembership.GROUP_ROW_ID + "=? "
+            + "AND " + GroupMembership.RAW_CONTACT_ID + "=?";
+
+    private static final String SELECTION_STARRED_FROM_RAW_CONTACTS =
+            "SELECT " + RawContacts.STARRED
+                    + " FROM " + Tables.RAW_CONTACTS + " WHERE " + RawContacts._ID + "=?";
 
     private interface DataContactsQuery {
         public static final String TABLE = "data "
@@ -439,9 +467,13 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/#/suggestions/*",
                 AGGREGATION_SUGGESTIONS);
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/#/photo", CONTACTS_PHOTO);
+        matcher.addURI(ContactsContract.AUTHORITY, "contacts/filter", CONTACTS_FILTER);
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/filter/*", CONTACTS_FILTER);
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/lookup/*", CONTACTS_LOOKUP);
+        matcher.addURI(ContactsContract.AUTHORITY, "contacts/lookup/*/data", CONTACTS_LOOKUP_DATA);
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/lookup/*/#", CONTACTS_LOOKUP_ID);
+        matcher.addURI(ContactsContract.AUTHORITY, "contacts/lookup/*/#/data",
+                CONTACTS_LOOKUP_ID_DATA);
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/as_vcard/*", CONTACTS_AS_VCARD);
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/as_multi_vcard/*",
                 CONTACTS_AS_MULTI_VCARD);
@@ -532,6 +564,7 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         sContactsProjectionMap.put(Contacts.HAS_PHONE_NUMBER, Contacts.HAS_PHONE_NUMBER);
         sContactsProjectionMap.put(Contacts.SEND_TO_VOICEMAIL, Contacts.SEND_TO_VOICEMAIL);
         sContactsProjectionMap.put(Contacts.LOOKUP_KEY, Contacts.LOOKUP_KEY);
+        sContactsProjectionMap.put(Contacts.NAME_RAW_CONTACT_ID, Contacts.NAME_RAW_CONTACT_ID);
 
         // Handle projections for Contacts-level statuses
         addProjection(sContactsProjectionMap, Contacts.CONTACT_PRESENCE,
@@ -882,6 +915,8 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         columns.put(Groups.DELETED, Groups.DELETED);
         columns.put(Groups.NOTES, Groups.NOTES);
         columns.put(Groups.SHOULD_SYNC, Groups.SHOULD_SYNC);
+        columns.put(Groups.FAVORITES, Groups.FAVORITES);
+        columns.put(Groups.AUTO_ADD, Groups.AUTO_ADD);
         columns.put(Groups.SYNC1, Groups.SYNC1);
         columns.put(Groups.SYNC2, Groups.SYNC2);
         columns.put(Groups.SYNC3, Groups.SYNC3);
@@ -1703,6 +1738,16 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
 
     public class GroupMembershipRowHandler extends DataRowHandler {
 
+        private static final String SELECTION_RAW_CONTACT_ID = RawContacts._ID + "=?";
+
+        private static final String QUERY_COUNT_FAVORITES_GROUP_MEMBERSHIPS_BY_RAW_CONTACT_ID =
+                "SELECT COUNT(*) FROM " + Tables.DATA + " LEFT OUTER JOIN " + Tables .GROUPS
+                        + " ON " + Tables.DATA + "." + GroupMembership.GROUP_ROW_ID
+                        + "=" + GroupsColumns.CONCRETE_ID
+                        + " WHERE " + DataColumns.MIMETYPE_ID + "=?"
+                        + " AND " + Tables.DATA + "." + GroupMembership.RAW_CONTACT_ID + "=?"
+                        + " AND " + Groups.FAVORITES + "!=0";
+
         public GroupMembershipRowHandler() {
             super(GroupMembership.CONTENT_ITEM_TYPE);
         }
@@ -1711,6 +1756,9 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         public long insert(SQLiteDatabase db, long rawContactId, ContentValues values) {
             resolveGroupSourceIdInValues(rawContactId, db, values, true);
             long dataId = super.insert(db, rawContactId, values);
+            if (hasFavoritesGroupMembership(db, rawContactId)) {
+                updateRawContactsStar(db, rawContactId, true /* starred */);
+            }
             updateVisibility(rawContactId);
             return dataId;
         }
@@ -1719,18 +1767,46 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         public boolean update(SQLiteDatabase db, ContentValues values, Cursor c,
                 boolean callerIsSyncAdapter) {
             long rawContactId = c.getLong(DataUpdateQuery.RAW_CONTACT_ID);
+            boolean wasStarred = hasFavoritesGroupMembership(db, rawContactId);
             resolveGroupSourceIdInValues(rawContactId, db, values, false);
             if (!super.update(db, values, c, callerIsSyncAdapter)) {
                 return false;
+            }
+            boolean isStarred = hasFavoritesGroupMembership(db, rawContactId);
+            if (wasStarred != isStarred) {
+                updateRawContactsStar(db, rawContactId, isStarred);
             }
             updateVisibility(rawContactId);
             return true;
         }
 
+        private void updateRawContactsStar(SQLiteDatabase db, long rawContactId, boolean starred) {
+            ContentValues rawContactValues = new ContentValues();
+            rawContactValues.put(RawContacts.STARRED, starred ? 1 : 0);
+            if (db.update(Tables.RAW_CONTACTS, rawContactValues, SELECTION_RAW_CONTACT_ID,
+                    new String[]{Long.toString(rawContactId)}) > 0) {
+                mContactAggregator.updateStarred(rawContactId);
+            }
+        }
+
+        private boolean hasFavoritesGroupMembership(SQLiteDatabase db, long rawContactId) {
+            final long groupMembershipMimetypeId = mDbHelper
+                    .getMimeTypeId(GroupMembership.CONTENT_ITEM_TYPE);
+            boolean isStarred = 0 < DatabaseUtils
+                    .longForQuery(db, QUERY_COUNT_FAVORITES_GROUP_MEMBERSHIPS_BY_RAW_CONTACT_ID,
+                    new String[]{Long.toString(groupMembershipMimetypeId), Long.toString(rawContactId)});
+            return isStarred;
+        }
+
         @Override
         public int delete(SQLiteDatabase db, Cursor c) {
             long rawContactId = c.getLong(DataDeleteQuery.RAW_CONTACT_ID);
+            boolean wasStarred = hasFavoritesGroupMembership(db, rawContactId);
             int count = super.delete(db, c);
+            boolean isStarred = hasFavoritesGroupMembership(db, rawContactId);
+            if (wasStarred && !isStarred) {
+                updateRawContactsStar(db, rawContactId, false /* starred */);
+            }
             updateVisibility(rawContactId);
             return count;
         }
@@ -2425,7 +2501,7 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
             }
 
             case RAW_CONTACTS: {
-                id = insertRawContact(uri, values);
+                id = insertRawContact(uri, values, callerIsSyncAdapter);
                 mSyncToNetwork |= !callerIsSyncAdapter;
                 break;
             }
@@ -2552,9 +2628,10 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
      *
      * @param uri the values for the new row
      * @param values the account this contact should be associated with. may be null.
+     * @param callerIsSyncAdapter
      * @return the row ID of the newly created row
      */
-    private long insertRawContact(Uri uri, ContentValues values) {
+    private long insertRawContact(Uri uri, ContentValues values, boolean callerIsSyncAdapter) {
         mValues.clear();
         mValues.putAll(values);
         mValues.putNull(RawContacts.CONTACT_ID);
@@ -2576,7 +2653,67 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         // Trigger creation of a Contact based on this RawContact at the end of transaction
         mInsertedRawContacts.put(rawContactId, account);
 
+        if (!callerIsSyncAdapter) {
+            addAutoAddMembership(rawContactId);
+            final Long starred = values.getAsLong(RawContacts.STARRED);
+            if (starred != null && starred != 0) {
+                updateFavoritesMembership(rawContactId, starred != 0);
+            }
+        }
+
         return rawContactId;
+    }
+
+    private void addAutoAddMembership(long rawContactId) {
+        final Long groupId = findGroupByRawContactId(SELECTION_AUTO_ADD_GROUPS_BY_RAW_CONTACT_ID,
+                rawContactId);
+        if (groupId != null) {
+            insertDataGroupMembership(rawContactId, groupId);
+        }
+    }
+
+    private Long findGroupByRawContactId(String selection, long rawContactId) {
+        Cursor c = mDb.query(Tables.GROUPS + "," + Tables.RAW_CONTACTS, PROJECTION_GROUP_ID,
+                selection,
+                new String[]{Long.toString(rawContactId)},
+                null /* groupBy */, null /* having */, null /* orderBy */);
+        try {
+            while (c.moveToNext()) {
+                return c.getLong(0);
+            }
+            return null;
+        } finally {
+            c.close();
+        }
+    }
+
+    private void updateFavoritesMembership(long rawContactId, boolean isStarred) {
+        final Long groupId = findGroupByRawContactId(SELECTION_FAVORITES_GROUPS_BY_RAW_CONTACT_ID,
+                rawContactId);
+        if (groupId != null) {
+            if (isStarred) {
+                insertDataGroupMembership(rawContactId, groupId);
+            } else {
+                deleteDataGroupMembership(rawContactId, groupId);
+            }
+        }
+    }
+
+    private void insertDataGroupMembership(long rawContactId, long groupId) {
+        ContentValues groupMembershipValues = new ContentValues();
+        groupMembershipValues.put(GroupMembership.GROUP_ROW_ID, groupId);
+        groupMembershipValues.put(GroupMembership.RAW_CONTACT_ID, rawContactId);
+        groupMembershipValues.put(DataColumns.MIMETYPE_ID,
+                mDbHelper.getMimeTypeId(GroupMembership.CONTENT_ITEM_TYPE));
+        mDb.insert(Tables.DATA, null, groupMembershipValues);
+    }
+
+    private void deleteDataGroupMembership(long rawContactId, long groupId) {
+        final String[] selectionArgs = {
+                Long.toString(mDbHelper.getMimeTypeId(GroupMembership.CONTENT_ITEM_TYPE)),
+                Long.toString(groupId),
+                Long.toString(rawContactId)};
+        mDb.delete(Tables.DATA, SELECTION_GROUPMEMBERSHIP_DATA, selectionArgs);
     }
 
     /**
@@ -3014,11 +3151,40 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         }
         mValues.remove(Groups.RES_PACKAGE);
 
+        final boolean isFavoritesGroup = mValues.getAsLong(Groups.FAVORITES) != null
+                ? mValues.getAsLong(Groups.FAVORITES) != 0
+                : false;
+
         if (!callerIsSyncAdapter) {
             mValues.put(Groups.DIRTY, 1);
         }
 
         long result = mDb.insert(Tables.GROUPS, Groups.TITLE, mValues);
+
+        if (!callerIsSyncAdapter && isFavoritesGroup) {
+            // add all starred raw contacts to this group
+            String selection;
+            String[] selectionArgs;
+            if (account == null) {
+                selection = RawContacts.ACCOUNT_NAME + " IS NULL AND "
+                        + RawContacts.ACCOUNT_TYPE + " IS NULL";
+                selectionArgs = null;
+            } else {
+                selection = RawContacts.ACCOUNT_NAME + "=? AND "
+                        + RawContacts.ACCOUNT_TYPE + "=?";
+                selectionArgs = new String[]{account.name, account.type};
+            }
+            Cursor c = mDb.query(Tables.RAW_CONTACTS,
+                    new String[]{RawContacts._ID, RawContacts.STARRED},
+                    selection, selectionArgs, null, null, null);
+            while (c.moveToNext()) {
+                if (c.getLong(1) != 0) {
+                    final long rawContactId = c.getLong(0);
+                    insertDataGroupMembership(rawContactId, result);
+                    setRawContactDirty(rawContactId);
+                }
+            }
+        }
 
         if (mValues.containsKey(Groups.GROUP_VISIBLE)) {
             mVisibleTouched = true;
@@ -3251,7 +3417,7 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
 
             case CONTACTS_ID: {
                 long contactId = ContentUris.parseId(uri);
-                return deleteContact(contactId);
+                return deleteContact(contactId, callerIsSyncAdapter);
             }
 
             case CONTACTS_LOOKUP: {
@@ -3263,7 +3429,7 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
                 }
                 final String lookupKey = pathSegments.get(2);
                 final long contactId = lookupContactIdByLookupKey(mDb, lookupKey);
-                return deleteContact(contactId);
+                return deleteContact(contactId, callerIsSyncAdapter);
             }
 
             case CONTACTS_LOOKUP_ID: {
@@ -3288,7 +3454,7 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
                 try {
                     if (c.getCount() == 1) {
                         // contact was unmodified so go ahead and delete it
-                        return deleteContact(contactId);
+                        return deleteContact(contactId, callerIsSyncAdapter);
                     } else {
                         // row was changed (e.g. the merging might have changed), we got multiple
                         // rows or the supplied selection filtered the record out
@@ -3405,7 +3571,7 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         return count;
     }
 
-    private int deleteContact(long contactId) {
+    private int deleteContact(long contactId, boolean callerIsSyncAdapter) {
         mSelectionArgs1[0] = Long.toString(contactId);
         Cursor c = mDb.query(Tables.RAW_CONTACTS, new String[]{RawContacts._ID},
                 RawContacts.CONTACT_ID + "=?", mSelectionArgs1,
@@ -3413,7 +3579,7 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         try {
             while (c.moveToNext()) {
                 long rawContactId = c.getLong(0);
-                markRawContactAsDeleted(rawContactId);
+                markRawContactAsDeleted(rawContactId, callerIsSyncAdapter);
             }
         } finally {
             c.close();
@@ -3431,7 +3597,7 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
             return count;
         } else {
             mDbHelper.removeContactIfSingleton(rawContactId);
-            return markRawContactAsDeleted(rawContactId);
+            return markRawContactAsDeleted(rawContactId, callerIsSyncAdapter);
         }
     }
 
@@ -3446,7 +3612,7 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
       return mDb.delete(Tables.PRESENCE, selection, selectionArgs);
     }
 
-    private int markRawContactAsDeleted(long rawContactId) {
+    private int markRawContactAsDeleted(long rawContactId, boolean callerIsSyncAdapter) {
         mSyncToNetwork = true;
 
         mValues.clear();
@@ -3455,7 +3621,7 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         mValues.put(RawContactsColumns.AGGREGATION_NEEDED, 1);
         mValues.putNull(RawContacts.CONTACT_ID);
         mValues.put(RawContacts.DIRTY, 1);
-        return updateRawContact(rawContactId, mValues);
+        return updateRawContact(rawContactId, mValues, callerIsSyncAdapter);
     }
 
     @Override
@@ -3492,12 +3658,12 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
             }
 
             case CONTACTS: {
-                count = updateContactOptions(values, selection, selectionArgs);
+                count = updateContactOptions(values, selection, selectionArgs, callerIsSyncAdapter);
                 break;
             }
 
             case CONTACTS_ID: {
-                count = updateContactOptions(ContentUris.parseId(uri), values);
+                count = updateContactOptions(ContentUris.parseId(uri), values, callerIsSyncAdapter);
                 break;
             }
 
@@ -3511,7 +3677,7 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
                 }
                 final String lookupKey = pathSegments.get(2);
                 final long contactId = lookupContactIdByLookupKey(mDb, lookupKey);
-                count = updateContactOptions(contactId, values);
+                count = updateContactOptions(contactId, values, callerIsSyncAdapter);
                 break;
             }
 
@@ -3547,7 +3713,7 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
 
             case RAW_CONTACTS: {
                 selection = appendAccountToSelection(uri, selection);
-                count = updateRawContacts(values, selection, selectionArgs);
+                count = updateRawContacts(values, selection, selectionArgs, callerIsSyncAdapter);
                 break;
             }
 
@@ -3556,10 +3722,12 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
                 if (selection != null) {
                     selectionArgs = insertSelectionArg(selectionArgs, String.valueOf(rawContactId));
                     count = updateRawContacts(values, RawContacts._ID + "=?"
-                                    + " AND(" + selection + ")", selectionArgs);
+                                    + " AND(" + selection + ")", selectionArgs,
+                            callerIsSyncAdapter);
                 } else {
                     mSelectionArgs1[0] = String.valueOf(rawContactId);
-                    count = updateRawContacts(values, RawContacts._ID + "=?", mSelectionArgs1);
+                    count = updateRawContacts(values, RawContacts._ID + "=?", mSelectionArgs1,
+                            callerIsSyncAdapter);
                 }
                 break;
             }
@@ -3724,7 +3892,8 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         return count;
     }
 
-    private int updateRawContacts(ContentValues values, String selection, String[] selectionArgs) {
+    private int updateRawContacts(ContentValues values, String selection, String[] selectionArgs,
+            boolean callerIsSyncAdapter) {
         if (values.containsKey(RawContacts.CONTACT_ID)) {
             throw new IllegalArgumentException(RawContacts.CONTACT_ID + " should not be included " +
                     "in content values. Contact IDs are assigned automatically");
@@ -3737,7 +3906,7 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         try {
             while (cursor.moveToNext()) {
                 long rawContactId = cursor.getLong(0);
-                updateRawContact(rawContactId, values);
+                updateRawContact(rawContactId, values, callerIsSyncAdapter);
                 count++;
             }
         } finally {
@@ -3747,7 +3916,8 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         return count;
     }
 
-    private int updateRawContact(long rawContactId, ContentValues values) {
+    private int updateRawContact(long rawContactId, ContentValues values,
+            boolean callerIsSyncAdapter) {
         final String selection = RawContacts._ID + " = ?";
         mSelectionArgs1[0] = Long.toString(rawContactId);
         final boolean requestUndoDelete = (values.containsKey(RawContacts.DELETED)
@@ -3783,8 +3953,30 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
                 }
             }
             if (values.containsKey(RawContacts.STARRED)) {
+                if (!callerIsSyncAdapter) {
+                    updateFavoritesMembership(rawContactId,
+                            values.getAsLong(RawContacts.STARRED) != 0);
+                }
                 mContactAggregator.updateStarred(rawContactId);
+            } else {
+                // if this raw contact is being associated with an account, then update the
+                // favorites group membership based on whether or not this contact is starred.
+                // If it is starred, add a group membership, if one doesn't already exist
+                // otherwise delete any matching group memberships.
+                if (!callerIsSyncAdapter && values.containsKey(RawContacts.ACCOUNT_NAME)) {
+                    boolean starred = 0 != DatabaseUtils.longForQuery(mDb,
+                            SELECTION_STARRED_FROM_RAW_CONTACTS,
+                            new String[]{Long.toString(rawContactId)});
+                    updateFavoritesMembership(rawContactId, starred);
+                }
             }
+
+            // if this raw contact is being associated with an account, then add a
+            // group membership to the group marked as AutoAdd, if any.
+            if (!callerIsSyncAdapter && values.containsKey(RawContacts.ACCOUNT_NAME)) {
+                addAutoAddMembership(rawContactId);
+            }
+
             if (values.containsKey(RawContacts.SOURCE_ID)) {
                 mContactAggregator.updateLookupKeyForRawContact(mDb, rawContactId);
             }
@@ -3866,7 +4058,7 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
     }
 
     private int updateContactOptions(ContentValues values, String selection,
-            String[] selectionArgs) {
+            String[] selectionArgs, boolean callerIsSyncAdapter) {
         int count = 0;
         Cursor cursor = mDb.query(mDbHelper.getContactView(),
                 new String[] { Contacts._ID }, selection,
@@ -3874,7 +4066,7 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         try {
             while (cursor.moveToNext()) {
                 long contactId = cursor.getLong(0);
-                updateContactOptions(contactId, values);
+                updateContactOptions(contactId, values, callerIsSyncAdapter);
                 count++;
             }
         } finally {
@@ -3884,7 +4076,8 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         return count;
     }
 
-    private int updateContactOptions(long contactId, ContentValues values) {
+    private int updateContactOptions(long contactId, ContentValues values,
+            boolean callerIsSyncAdapter) {
 
         mValues.clear();
         ContactsDatabaseHelper.copyStringValue(mValues, RawContacts.CUSTOM_RINGTONE,
@@ -3910,6 +4103,21 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
 
         mSelectionArgs1[0] = String.valueOf(contactId);
         mDb.update(Tables.RAW_CONTACTS, mValues, RawContacts.CONTACT_ID + "=?", mSelectionArgs1);
+
+        if (mValues.containsKey(RawContacts.STARRED) && !callerIsSyncAdapter) {
+            Cursor cursor = mDb.query(mDbHelper.getRawContactView(),
+                    new String[] { RawContacts._ID }, RawContacts.CONTACT_ID + "=?",
+                    mSelectionArgs1, null, null, null);
+            try {
+                while (cursor.moveToNext()) {
+                    long rawContactId = cursor.getLong(0);
+                    updateFavoritesMembership(rawContactId,
+                            mValues.getAsLong(RawContacts.STARRED) != 0);
+                }
+            } finally {
+                cursor.close();
+            }
+        }
 
         // Copy changeable values to prevent automatically managed fields from
         // being explicitly updated by clients.
@@ -3978,40 +4186,12 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
         return 1;
     }
 
-    /**
-     * Check whether GOOGLE_MY_CONTACTS_GROUP exists, otherwise create it.
-     *
-     * @return the group id
-     */
-    private long getOrCreateMyContactsGroupInTransaction(String accountName, String accountType) {
-        Cursor cursor = mDb.query(Tables.GROUPS, new String[] {"_id"},
-                Groups.ACCOUNT_NAME + " =? AND " + Groups.ACCOUNT_TYPE + " =? AND "
-                    + Groups.TITLE + " =?",
-                new String[] {accountName, accountType, GOOGLE_MY_CONTACTS_GROUP_TITLE},
-                null, null, null);
-        try {
-            if(cursor.moveToNext()) {
-                return cursor.getLong(0);
-            }
-        } finally {
-            cursor.close();
-        }
-
-        ContentValues values = new ContentValues();
-        values.put(Groups.TITLE, GOOGLE_MY_CONTACTS_GROUP_TITLE);
-        values.put(Groups.ACCOUNT_NAME, accountName);
-        values.put(Groups.ACCOUNT_TYPE, accountType);
-        values.put(Groups.GROUP_VISIBLE, "1");
-        return mDb.insert(Tables.GROUPS, null, values);
-    }
-
     public void onAccountsUpdated(Account[] accounts) {
         // TODO : Check the unit test.
         HashSet<Account> existingAccounts = new HashSet<Account>();
-        boolean hasUnassignedContacts[] = new boolean[]{false};
         mDb.beginTransaction();
         try {
-            findValidAccounts(existingAccounts, hasUnassignedContacts);
+            findValidAccounts(existingAccounts);
 
             // Add a row to the ACCOUNTS table for each new account
             for (Account account : accounts) {
@@ -4085,59 +4265,6 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
                 }
             }
 
-            if (hasUnassignedContacts[0]) {
-
-                Account primaryAccount = null;
-                for (Account account : accounts) {
-                    if (isWritableAccount(account.type)) {
-                        primaryAccount = account;
-                        break;
-                    }
-                }
-
-                if (primaryAccount != null) {
-                    String[] params = new String[] {primaryAccount.name, primaryAccount.type};
-                    if (primaryAccount.type.equals(DEFAULT_ACCOUNT_TYPE)) {
-                        long groupId = getOrCreateMyContactsGroupInTransaction(
-                                primaryAccount.name, primaryAccount.type);
-                        if (groupId != -1) {
-                            long mimeTypeId = mDbHelper.getMimeTypeId(
-                                    GroupMembership.CONTENT_ITEM_TYPE);
-                            mDb.execSQL(
-                                    "INSERT INTO " + Tables.DATA + "(" + DataColumns.MIMETYPE_ID +
-                                        ", " + Data.RAW_CONTACT_ID + ", "
-                                        + GroupMembership.GROUP_ROW_ID + ") " +
-                                    "SELECT " + mimeTypeId + ", "
-                                            + RawContacts._ID + ", " + groupId +
-                                    " FROM " + Tables.RAW_CONTACTS +
-                                    " WHERE " + RawContacts.ACCOUNT_NAME + " IS NULL" +
-                                    " AND " + RawContacts.ACCOUNT_TYPE + " IS NULL"
-                            );
-                        }
-                    }
-                    mDb.execSQL(
-                            "UPDATE " + Tables.RAW_CONTACTS +
-                            " SET " + RawContacts.ACCOUNT_NAME + "=?,"
-                                    + RawContacts.ACCOUNT_TYPE + "=?" +
-                            " WHERE " + RawContacts.ACCOUNT_NAME + " IS NULL" +
-                            " AND " + RawContacts.ACCOUNT_TYPE + " IS NULL", params);
-
-                    // We don't currently support groups for unsynced accounts, so this is for
-                    // the future
-                    mDb.execSQL(
-                            "UPDATE " + Tables.GROUPS +
-                            " SET " + Groups.ACCOUNT_NAME + "=?,"
-                                    + Groups.ACCOUNT_TYPE + "=?" +
-                            " WHERE " + Groups.ACCOUNT_NAME + " IS NULL" +
-                            " AND " + Groups.ACCOUNT_TYPE + " IS NULL", params);
-
-                    mDb.execSQL(
-                            "DELETE FROM " + Tables.ACCOUNTS +
-                            " WHERE " + RawContacts.ACCOUNT_NAME + " IS NULL" +
-                            " AND " + RawContacts.ACCOUNT_TYPE + " IS NULL");
-                }
-            }
-
             mDbHelper.updateAllVisible();
 
             mDbHelper.getSyncState().onAccountsChanged(mDb, accounts);
@@ -4151,15 +4278,13 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
     /**
      * Finds all distinct accounts present in the specified table.
      */
-    private void findValidAccounts(Set<Account> validAccounts, boolean[] hasUnassignedContacts) {
+    private void findValidAccounts(Set<Account> validAccounts) {
         Cursor c = mDb.rawQuery(
                 "SELECT " + RawContacts.ACCOUNT_NAME + "," + RawContacts.ACCOUNT_TYPE +
                 " FROM " + Tables.ACCOUNTS, null);
         try {
             while (c.moveToNext()) {
-                if (c.isNull(0) && c.isNull(1)) {
-                    hasUnassignedContacts[0] = true;
-                } else {
+                if (!c.isNull(0) || !c.isNull(1)) {
                     validAccounts.add(new Account(c.getString(0), c.getString(1)));
                 }
             }
@@ -4263,6 +4388,48 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
                 selectionArgs = insertSelectionArg(selectionArgs,
                         String.valueOf(lookupContactIdByLookupKey(db, lookupKey)));
                 qb.appendWhere(Contacts._ID + "=?");
+                break;
+            }
+
+            case CONTACTS_LOOKUP_DATA:
+            case CONTACTS_LOOKUP_ID_DATA: {
+                List<String> pathSegments = uri.getPathSegments();
+                int segmentCount = pathSegments.size();
+                if (segmentCount < 4) {
+                    throw new IllegalArgumentException(mDbHelper.exceptionMessage(
+                            "Missing a lookup key", uri));
+                }
+                String lookupKey = pathSegments.get(2);
+                if (segmentCount == 5) {
+                    long contactId = Long.parseLong(pathSegments.get(3));
+                    SQLiteQueryBuilder lookupQb = new SQLiteQueryBuilder();
+                    setTablesAndProjectionMapForData(lookupQb, uri, projection, false);
+                    String[] args;
+                    if (selectionArgs == null) {
+                        args = new String[2];
+                    } else {
+                        args = new String[selectionArgs.length + 2];
+                        System.arraycopy(selectionArgs, 0, args, 2, selectionArgs.length);
+                    }
+                    args[0] = String.valueOf(contactId);
+                    args[1] = Uri.encode(lookupKey);
+                    lookupQb.appendWhere(" AND " + Data.CONTACT_ID + "=?"
+                            + " AND " + Data.LOOKUP_KEY + "=?");
+                    Cursor c = query(db, lookupQb, projection, selection, args, sortOrder,
+                            groupBy, limit);
+                    if (c.getCount() != 0) {
+                        return c;
+                    }
+
+                    c.close();
+
+                    // TODO see if the contact exists but has no data rows (rare)
+                }
+
+                setTablesAndProjectionMapForData(qb, uri, projection, false);
+                selectionArgs = insertSelectionArg(selectionArgs,
+                        String.valueOf(lookupContactIdByLookupKey(db, lookupKey)));
+                qb.appendWhere(" AND " + Data.CONTACT_ID + "=?");
                 break;
             }
 
@@ -5176,25 +5343,30 @@ public class ContactsProvider2 extends SQLiteContentProvider implements OnAccoun
                     ") AS " + SearchSnippetColumns.SNIPPET_MIMETYPE);
         }
 
-        sb.append(" FROM " + Tables.DATA_JOIN_RAW_CONTACTS +
-                " WHERE " + DataColumns.CONCRETE_ID +
-                " IN (");
+        sb.append(" FROM " + Tables.DATA_JOIN_RAW_CONTACTS + " WHERE ");
 
-        // Construct a query that gives us exactly one data _id per matching contact.
-        // MIN stands in for ANY in this context.
-        sb.append(
-                "SELECT MIN(" + Tables.NAME_LOOKUP + "." + NameLookupColumns.DATA_ID + ")" +
-                " FROM " + Tables.NAME_LOOKUP +
-                " JOIN " + Tables.RAW_CONTACTS +
-                " ON (" + RawContactsColumns.CONCRETE_ID
-                        + "=" + Tables.NAME_LOOKUP + "." + NameLookupColumns.RAW_CONTACT_ID + ")" +
-                " WHERE " + NameLookupColumns.NORMALIZED_NAME + " GLOB '");
-        sb.append(NameNormalizer.normalize(filter));
-        sb.append("*' AND " + NameLookupColumns.NAME_TYPE +
-                    " IN(" + CONTACT_LOOKUP_NAME_TYPES + ")" +
-                " GROUP BY " + RawContactsColumns.CONCRETE_CONTACT_ID);
+        if (!TextUtils.isEmpty(filter)) {
+            sb.append(DataColumns.CONCRETE_ID + " IN (");
 
-        sb.append(")) ON (" + Contacts._ID + "=snippet_contact_id)");
+            // Construct a query that gives us exactly one data _id per matching contact.
+            // MIN stands in for ANY in this context.
+            sb.append(
+                    "SELECT MIN(" + Tables.NAME_LOOKUP + "." + NameLookupColumns.DATA_ID + ")" +
+                    " FROM " + Tables.NAME_LOOKUP +
+                    " JOIN " + Tables.RAW_CONTACTS +
+                    " ON (" + RawContactsColumns.CONCRETE_ID
+                            + "=" + Tables.NAME_LOOKUP + "." + NameLookupColumns.RAW_CONTACT_ID + ")" +
+                    " WHERE " + NameLookupColumns.NORMALIZED_NAME + " GLOB '");
+            sb.append(NameNormalizer.normalize(filter));
+            sb.append("*' AND " + NameLookupColumns.NAME_TYPE +
+                        " IN(" + CONTACT_LOOKUP_NAME_TYPES + ")" +
+                    " GROUP BY " + RawContactsColumns.CONCRETE_CONTACT_ID +
+                    ")");
+        } else {
+            sb.append("0");     // Empty filter - return an empty set
+        }
+
+        sb.append(") ON (" + Contacts._ID + "=snippet_contact_id)");
 
         qb.setTables(sb.toString());
         qb.setProjectionMap(sContactsProjectionWithSnippetMap);
