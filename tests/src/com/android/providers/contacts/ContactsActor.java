@@ -158,6 +158,13 @@ public class ContactsActor {
         public ContentResolver getContentResolver() {
             return mResolver;
         }
+
+        @Override
+        public ApplicationInfo getApplicationInfo() {
+            ApplicationInfo ai = new ApplicationInfo();
+            ai.packageName = "contactsTestPackage";
+            return ai;
+        }
     }
 
     private static class RestrictionMockResources extends MockResources {
